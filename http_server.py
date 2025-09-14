@@ -1,6 +1,14 @@
 from flask import Flask, request, send_file
 from TTS.api import TTS
-from TTS.tts.utils.text.cleaners import english_cleaners, multilingual_cleaners
+from TTS.tts.utils.text.cleaners import (
+    english_cleaners, 
+    french_cleaners, 
+    portuguese_cleaners, 
+    chinese_mandarin_cleaners,
+    basic_german_cleaners,
+    basic_turkish_cleaners,
+    multilingual_cleaners
+)
 import torch
 import os
 import io
@@ -28,8 +36,18 @@ def clean_text_for_tts(text: str, language: str) -> str:
     # Use language-specific cleaners that handle punctuation correctly
     if language == "en":
         return english_cleaners(text)
+    elif language == "fr":
+        return french_cleaners(text)
+    elif language == "pt":
+        return portuguese_cleaners(text)
+    elif language == "zh" or language == "zh-cn":
+        return chinese_mandarin_cleaners(text)
+    elif language == "de":
+        return basic_german_cleaners(text)
+    elif language == "tr":
+        return basic_turkish_cleaners(text)
     else:
-        # For multilingual models, use multilingual_cleaners which handles punctuation
+        # For multilingual models or unsupported languages, use multilingual_cleaners
         return multilingual_cleaners(text)
 
 def split_sentences(text: str, max_len: int = MAX_CHARS) -> List[str]:
