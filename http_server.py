@@ -1,5 +1,6 @@
 from flask import Flask, request, send_file
 from TTS.api import TTS
+from TTS.tts.utils.text.cleaners import english_cleaners, multilingual_cleaners
 import torch
 import os
 import io
@@ -18,6 +19,18 @@ tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
 # ---------------------------------------------------------------------------
 
 MAX_CHARS = 250*4  # safe length per request after tokenizer limit increase
+
+def clean_text_for_tts(text: str, language: str) -> str:
+    """Apply appropriate text cleaner based on language to handle punctuation properly."""
+    if not text:
+        return text
+    
+    # Use language-specific cleaners that handle punctuation correctly
+    if language == "en":
+        return english_cleaners(text)
+    else:
+        # For multilingual models, use multilingual_cleaners which handles punctuation
+        return multilingual_cleaners(text)
 
 def split_sentences(text: str, max_len: int = MAX_CHARS) -> List[str]:
     """Split text into sentence-based chunks not exceeding *max_len* characters."""
@@ -41,7 +54,9 @@ def split_sentences(text: str, max_len: int = MAX_CHARS) -> List[str]:
 def synth_segment(text: str, language: str, speaker: Optional[str], **kwargs) -> io.BytesIO:
     """Synthesize a single segment and return it as a BytesIO WAV buffer."""
     buf = io.BytesIO()
-    tts.tts_to_file(text=text, language=language, file_path=buf, speaker=speaker, **kwargs)
+    # Clean text using appropriate language-specific cleaner to handle punctuation
+    cleaned_text = clean_text_for_tts(text, language)
+    tts.tts_to_file(text=cleaned_text, language=language, file_path=buf, speaker=speaker, **kwargs)
     buf.seek(0)
     return buf
 
