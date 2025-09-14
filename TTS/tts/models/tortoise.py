@@ -1,7 +1,6 @@
 import logging
 import os
 import random
-from contextlib import contextmanager
 from dataclasses import dataclass
 from time import time
 from typing import Any
@@ -12,6 +11,7 @@ import torchaudio
 from coqpit import Coqpit
 from tqdm import tqdm
 
+from TTS.tts.configs.shared_configs import BaseTTSConfig
 from TTS.tts.layers.tortoise.arch_utils import TorchMelSpectrogram
 from TTS.tts.layers.tortoise.audio_utils import (
     denormalize_tacotron_mel,
@@ -28,8 +28,11 @@ from TTS.tts.layers.tortoise.tokenizer import VoiceBpeTokenizer
 from TTS.tts.layers.tortoise.vocoder import VocConf, VocType
 from TTS.tts.layers.tortoise.wav2vec_alignment import Wav2VecAlignment
 from TTS.tts.models.base_tts import BaseTTS
-from TTS.utils.generic_utils import is_pytorch_at_least_2_4
-from TTS.utils.voices import CloningMixin
+from TTS.utils.generic_utils import (
+    is_pytorch_at_least_2_4,
+    warn_synthesize_config_deprecated,
+    warn_synthesize_speaker_id_deprecated,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +224,7 @@ class TortoiseArgs(Coqpit):
     Args:
         autoregressive_batch_size (int): The size of the auto-regressive batch.
         enable_redaction (bool, optional): Whether to enable redaction. Defaults to True.
-        high_vram (bool, optional): Whether to use high VRAM. Defaults to False.
+        high_vram (bool, optional): Deprecated, has no effect.
         kv_cache (bool, optional): Whether to use the kv_cache. Defaults to True.
         ar_checkpoint (str, optional): The checkpoint for the autoregressive model. Defaults to None.
         clvp_checkpoint (str, optional): The checkpoint for the ConditionalLatentVariablePerseq model. Defaults to None.
@@ -322,7 +325,7 @@ class TortoiseArgs(Coqpit):
     duration_const: int = 102400
 
 
-class Tortoise(CloningMixin, BaseTTS):
+class Tortoise(BaseTTS):
     """Tortoise model class.
 
     Currently only supports inference.
@@ -364,7 +367,7 @@ class Tortoise(CloningMixin, BaseTTS):
             start_text_token=self.args.ar_start_text_token,
             checkpointing=self.args.ar_checkpointing,
             train_solo_embeddings=self.args.ar_train_solo_embeddings,
-        ).cpu()
+        )
 
         self.diffusion = DiffusionTts(
             model_channels=self.args.diff_model_channels,
@@ -378,7 +381,7 @@ class Tortoise(CloningMixin, BaseTTS):
             num_heads=self.args.diff_num_heads,
             layer_drop=self.args.diff_layer_drop,
             unconditioned_percentage=self.args.diff_unconditioned_percentage,
-        ).cpu()
+        )
 
         self.clvp = CLVP(
             dim_text=self.args.clvp_dim_text,
@@ -393,29 +396,13 @@ class Tortoise(CloningMixin, BaseTTS):
             speech_heads=self.args.clvp_speech_heads,
             speech_seq_len=self.args.clvp_speech_seq_len,
             use_xformers=self.args.clvp_use_xformers,
-        ).cpu()
+        )
 
-        self.vocoder = self.args.vocoder.value.constructor().cpu()
+        self.vocoder = self.args.vocoder.value.constructor()
 
         # Random latent generators (RLGs) are loaded lazily.
         self.rlg_auto = None
         self.rlg_diffusion = None
-
-        if self.args.high_vram:
-            self.autoregressive = self.autoregressive.to(self.device)
-            self.diffusion = self.diffusion.to(self.device)
-            self.clvp = self.clvp.to(self.device)
-            self.vocoder = self.vocoder.to(self.device)
-        self.high_vram = self.args.high_vram
-
-    @contextmanager
-    def temporary_cuda(self, model):
-        if self.high_vram:
-            yield model
-        else:
-            m = model.to(self.device)
-            yield m
-            m = model.cpu()
 
     def get_conditioning_latents(
         self,
@@ -448,8 +435,7 @@ class Tortoise(CloningMixin, BaseTTS):
             for ls in voice_samples:
                 auto_conds.append(format_conditioning(ls[0], device=self.device, mel_norm_file=self.mel_norm_path))
             auto_conds = torch.stack(auto_conds, dim=1)
-            with self.temporary_cuda(self.autoregressive) as ar:
-                auto_latent = ar.get_conditioning(auto_conds)
+            auto_latent = self.autoregressive.get_conditioning(auto_conds)
 
             diffusion_conds = []
 
@@ -485,9 +471,7 @@ class Tortoise(CloningMixin, BaseTTS):
                     if latent_averaging_mode == 2:
                         diffusion_conds.append(torch.stack(temp_diffusion_conds).mean(0))
             diffusion_conds = torch.stack(diffusion_conds, dim=1)
-
-            with self.temporary_cuda(self.diffusion) as diffusion:
-                diffusion_latent = diffusion.get_conditioning(diffusion_conds)
+            diffusion_latent = self.diffusion.get_conditioning(diffusion_conds)
 
         return auto_latent, diffusion_latent
 
@@ -529,19 +513,21 @@ class Tortoise(CloningMixin, BaseTTS):
     def synthesize(
         self,
         text: str,
-        config: "TortoiseConfig",
-        speaker_wav: str | os.PathLike[Any] | list[str | os.PathLike[Any]] | None,
-        speaker_id: str | None = None,
+        config: BaseTTSConfig | None = None,
+        *,
+        speaker: str | None = None,
+        speaker_wav: str | os.PathLike[Any] | list[str | os.PathLike[Any]] | None = None,
         voice_dir: str | os.PathLike[Any] | None = None,
         **kwargs,
-    ):
+    ) -> dict[str, Any]:
         """Synthesize speech with the given input text.
 
         Args:
             text: Input text.
-            config: Config with inference parameters.
-            speaker_id (str): One of the available speaker names. If `random`, it generates a random speaker.
-            voice_dirs (List[str]): List of paths that host reference audio files for speakers. Defaults to None.
+            config: DEPRECATED. Not used.
+            speaker: Custom speaker ID to cache or retrieve a voice.
+            speaker_wav: Path(s) to reference audio.
+            voice_dir: Folder for cached voices.
             **kwargs: Inference settings. See `inference()`.
 
         Returns:
@@ -550,16 +536,23 @@ class Tortoise(CloningMixin, BaseTTS):
             as latents used at inference.
 
         """
+        if config is not None:
+            warn_synthesize_config_deprecated()
+        if (speaker_id := kwargs.pop("speaker_id", None)) is not None:
+            speaker = speaker_id
+            warn_synthesize_speaker_id_deprecated()
+        for key in ("use_griffin_lim", "do_trim_silence", "extra_aux_input", "language"):
+            kwargs.pop(key, None)
         conditioning_latents = None
-        if speaker_wav is not None or speaker_id is not None:
+        if speaker_wav is not None or speaker is not None:
             voice_settings = {
                 "latent_averaging_mode": kwargs.pop("latent_averaging_mode", 0),
                 "original_tortoise": kwargs.pop("original_tortoise", False),
             }
-            voice = self.clone_voice(speaker_wav, speaker_id, voice_dir, **voice_settings)
+            voice = self.clone_voice(speaker_wav, speaker, voice_dir, **voice_settings)
             conditioning_latents = voice["auto_conditioning"], voice["diffusion_conditioning"]
 
-        outputs = self.inference_with_config(text, config, conditioning_latents=conditioning_latents, **kwargs)
+        outputs = self.inference_with_config(text, conditioning_latents=conditioning_latents, **kwargs)
 
         return {
             "wav": outputs["wav"],
@@ -568,20 +561,20 @@ class Tortoise(CloningMixin, BaseTTS):
             "conditioning_latents": outputs["conditioning_latents"],
         }
 
-    def inference_with_config(self, text, config, **kwargs):
+    def inference_with_config(self, text, **kwargs):
         """
         inference with config
         #TODO describe in detail
         """
         # Use generally found best tuning knobs for generation.
         settings = {
-            "temperature": config.temperature,
-            "length_penalty": config.length_penalty,
-            "repetition_penalty": config.repetition_penalty,
-            "top_p": config.top_p,
-            "cond_free_k": config.cond_free_k,
-            "diffusion_temperature": config.diffusion_temperature,
-            "sampler": config.sampler,
+            "temperature": self.config.temperature,
+            "length_penalty": self.config.length_penalty,
+            "repetition_penalty": self.config.repetition_penalty,
+            "top_p": self.config.top_p,
+            "cond_free_k": self.config.cond_free_k,
+            "diffusion_temperature": self.config.diffusion_temperature,
+            "sampler": self.config.sampler,
         }
         # Presets are defined here.
         presets = {
@@ -724,12 +717,9 @@ class Tortoise(CloningMixin, BaseTTS):
             )
             self.autoregressive = self.autoregressive.to(self.device)
             logger.info("Generating autoregressive samples..")
-            with (
-                self.temporary_cuda(self.autoregressive) as autoregressive,
-                torch.autocast(device_type="cuda", dtype=torch.float16, enabled=half),
-            ):
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=half):
                 for b in tqdm(range(num_batches), disable=not verbose):
-                    codes = autoregressive.inference_speech(
+                    codes = self.autoregressive.inference_speech(
                         auto_conditioning,
                         text_tokens,
                         do_sample=True,
@@ -747,14 +737,11 @@ class Tortoise(CloningMixin, BaseTTS):
             self.autoregressive_batch_size = orig_batch_size  # in the case of single_sample
 
             clip_results = []
-            with (
-                self.temporary_cuda(self.clvp) as clvp,
-                torch.autocast(device_type="cuda", dtype=torch.float16, enabled=half),
-            ):
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=half):
                 for batch in tqdm(samples, disable=not verbose):
                     for i in range(batch.shape[0]):
                         batch[i] = fix_autoregressive_output(batch[i], stop_mel_token)
-                    clvp_res = clvp(
+                    clvp_res = self.clvp(
                         text_tokens.repeat(batch.shape[0], 1),
                         batch,
                         return_loss=False,
@@ -769,19 +756,18 @@ class Tortoise(CloningMixin, BaseTTS):
             # The diffusion model actually wants the last hidden layer from the autoregressive model as conditioning
             # inputs. Re-produce those for the top results. This could be made more efficient by storing all of these
             # results, but will increase memory usage.
-            with self.temporary_cuda(self.autoregressive) as autoregressive:
-                best_latents = autoregressive(
-                    auto_conditioning.repeat(k, 1),
-                    text_tokens.repeat(k, 1),
-                    torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
-                    best_results,
-                    torch.tensor(
-                        [best_results.shape[-1] * self.autoregressive.mel_length_compression],
-                        device=text_tokens.device,
-                    ),
-                    return_latent=True,
-                    clip_inputs=False,
-                )
+            best_latents = self.autoregressive(
+                auto_conditioning.repeat(k, 1),
+                text_tokens.repeat(k, 1),
+                torch.tensor([text_tokens.shape[-1]], device=self.device),
+                best_results,
+                torch.tensor(
+                    [best_results.shape[-1] * self.autoregressive.mel_length_compression],
+                    device=self.device,
+                ),
+                return_latent=True,
+                clip_inputs=False,
+            )
             del auto_conditioning
 
             logger.info("Transforming autoregressive outputs into audio..")
@@ -800,18 +786,16 @@ class Tortoise(CloningMixin, BaseTTS):
                     if ctokens > 8:  # 8 tokens gives the diffusion model some "breathing room" to terminate speech.
                         latents = latents[:, :code]
                         break
-                with self.temporary_cuda(self.diffusion) as diffusion:
-                    mel = do_spectrogram_diffusion(
-                        diffusion,
-                        diffuser,
-                        latents,
-                        diffusion_conditioning,
-                        temperature=diffusion_temperature,
-                        verbose=verbose,
-                    )
-                with self.temporary_cuda(self.vocoder) as vocoder:
-                    wav = vocoder.inference(mel)
-                    wav_candidates.append(wav.cpu())
+                mel = do_spectrogram_diffusion(
+                    self.diffusion,
+                    diffuser,
+                    latents,
+                    diffusion_conditioning,
+                    temperature=diffusion_temperature,
+                    verbose=verbose,
+                )
+                wav = self.vocoder.inference(mel)
+                wav_candidates.append(wav.cpu())
 
             def potentially_redact(clip, text):
                 if self.enable_redaction:

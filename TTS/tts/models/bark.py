@@ -1,9 +1,11 @@
+import logging
 import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torchaudio
 from coqpit import Coqpit
@@ -11,6 +13,7 @@ from encodec import EncodecModel
 from encodec.utils import convert_audio
 from transformers import BertTokenizer
 
+from TTS.tts.configs.shared_configs import BaseTTSConfig
 from TTS.tts.layers.bark.hubert.hubert_manager import HubertManager
 from TTS.tts.layers.bark.hubert.kmeans_hubert import CustomHubert
 from TTS.tts.layers.bark.hubert.tokenizer import HubertTokenizer
@@ -24,7 +27,14 @@ from TTS.tts.layers.bark.load_model import load_model
 from TTS.tts.layers.bark.model import GPT
 from TTS.tts.layers.bark.model_fine import FineGPT
 from TTS.tts.models.base_tts import BaseTTS
-from TTS.utils.voices import CloningMixin
+from TTS.utils.generic_utils import (
+    is_pytorch_at_least_2_4,
+    slugify,
+    warn_synthesize_config_deprecated,
+    warn_synthesize_speaker_id_deprecated,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -33,7 +43,7 @@ class BarkAudioConfig(Coqpit):
     output_sample_rate: int = 24000
 
 
-class Bark(CloningMixin, BaseTTS):
+class Bark(BaseTTS):
     def __init__(
         self,
         config: Coqpit,
@@ -208,25 +218,64 @@ class Bark(CloningMixin, BaseTTS):
         metadata = {"name": self.config["model"]}
         return voice, metadata
 
-    # TODO: remove config from synthesize
+    def get_voices(self, voice_dir: str | os.PathLike[Any]) -> dict[str, Path]:
+        """Return all available voices in the given directory.
+
+        Args:
+            voice_dir: Directory to search for voices.
+
+        Returns:
+            Dictionary mapping a speaker ID to its voice file.
+        """
+        # For Bark we overwrite the base method to also allow loading the npz
+        # files included with the original model.
+        return {path.stem: path for path in Path(voice_dir).iterdir() if path.suffix in (".npz", ".pth")}
+
+    def load_voice_file(
+        self,
+        speaker_id: str,
+        voice_dir: str | os.PathLike[Any],
+    ) -> dict[str, Any]:
+        """Load the voice for the given speaker.
+
+        Args:
+            speaker_id:
+                Speaker ID to load.
+            voice_dir:
+                Directory where to look for the voice.
+        """
+        # For Bark we overwrite the base method to also allow loading the npz
+        # files included with the original model.
+        voices = self.get_voices(voice_dir)
+        if speaker_id not in voices:
+            msg = f"Voice file `{slugify(speaker_id)}.pth` or .npz for speaker `{speaker_id}` not found in: {voice_dir}"
+            raise FileNotFoundError(msg)
+        if voices[speaker_id].suffix == ".npz":
+            np_voice = np.load(voices[speaker_id])
+            voice = {key: torch.tensor(np_voice[key]) for key in np_voice.keys()}
+        else:
+            voice = torch.load(voices[speaker_id], map_location="cpu", weights_only=is_pytorch_at_least_2_4())
+        logger.info("Loaded voice `%s` from: %s", speaker_id, voices[speaker_id])
+        return voice
+
     def synthesize(
         self,
         text: str,
-        config: "BarkConfig",
-        speaker_wav: str | os.PathLike[Any] | list[str | os.PathLike[Any]] | None,
-        speaker_id: str | None = None,
+        config: BaseTTSConfig | None = None,
+        *,
+        speaker: str | None = None,
+        speaker_wav: str | os.PathLike[Any] | list[str | os.PathLike[Any]] | None = None,
         voice_dir: str | os.PathLike[Any] | None = None,
         **kwargs,
-    ):  # pylint: disable=unused-argument
+    ) -> dict[str, Any]:
         """Synthesize speech with the given input text.
 
         Args:
             text (str): Input text.
-            config (BarkConfig): Config with inference parameters.
-            speaker_id (str): One of the available speaker names. If `random`, it generates a random speaker.
-            speaker_wav (str): Path to the speaker audio file for cloning a new voice. It is cloned and saved in
-                `voice_dirs` with the name `speaker_id`. Defaults to None.
-            voice_dirs (List[str]): List of paths that host reference audio files for speakers. Defaults to None.
+            config: DEPRECATED. Not used.
+            speaker: Custom speaker ID to cache or retrieve a voice.
+            speaker_wav: Path(s) to reference audio.
+            voice_dir: Folder for cached voices.
             **kwargs: Model specific inference settings used by `generate_audio()` and
                       `TTS.tts.layers.bark.inference_funcs.generate_text_semantic()`.
 
@@ -237,17 +286,20 @@ class Bark(CloningMixin, BaseTTS):
             `conditioning_latents` as latents used at inference.
 
         """
+        if config is not None:
+            warn_synthesize_config_deprecated()
+        if (speaker_id := kwargs.pop("speaker_id", None)) is not None:
+            speaker = speaker_id
+            warn_synthesize_speaker_id_deprecated()
         history_prompt = None, None, None
-        if speaker_wav is not None or speaker_id is not None:
-            voice = self.clone_voice(speaker_wav, speaker_id, voice_dir)
+        if speaker_wav is not None or speaker is not None:
+            voice = self.clone_voice(speaker_wav, speaker, voice_dir)
             history_prompt = (voice["semantic_prompt"], voice["coarse_prompt"], voice["fine_prompt"])
         outputs = self.generate_audio(text, history_prompt=history_prompt, **kwargs)
         return {
             "wav": outputs[0],
             "text_inputs": text,
         }
-
-    def eval_step(self): ...
 
     def forward(self): ...
 
