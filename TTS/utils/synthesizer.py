@@ -371,7 +371,7 @@ class Synthesizer(nn.Module):
         if self.use_cuda:
             vocoder_device = "cuda"
 
-        if not source_wav:  # not voice conversion
+        if not source_wav and text:  # not voice conversion and has text
             for sen in sens:
                 outputs = self.tts_model.synthesize(
                     text=sen,
