@@ -32,7 +32,10 @@ def acquire_instance():
     gpu_range = range(min(num_gpus, total))
     cpu_range = range(num_gpus, total)
     while True:
-        for i in gpu_range:
+        # Rotate GPU preference to balance across devices
+        g = list(gpu_range)
+        s = (int(time.time() * 1000) % len(g)) if g else 0
+        for i in (g[s:] + g[:s]):
             if QUEUE_SEMAPHORES[i].acquire(blocking=False):
                 INSTANCE_LOCKS[i].acquire()
                 return TTS_INSTANCES[i], INSTANCE_LOCKS[i], i
