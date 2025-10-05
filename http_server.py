@@ -29,7 +29,7 @@ devices = [f"cuda:{i}" for i in range(num_gpus)] + ["cpu"] * max(1, cpu_workers)
 
 TTS_INSTANCES = [TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(dev) for dev in devices]
 INSTANCE_LOCKS = [Lock() for _ in TTS_INSTANCES]
-WORKER_BACKLOG = int(os.environ.get("TTS_WORKER_BACKLOG", "3"))
+WORKER_BACKLOG = int(os.environ.get("TTS_WORKER_BACKLOG", "4"))
 QUEUE_SEMAPHORES = [Semaphore(WORKER_BACKLOG) for _ in TTS_INSTANCES]
 gc.collect()
 
