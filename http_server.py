@@ -10,35 +10,37 @@ import wave
 import gc
 from contextlib import contextmanager
 from typing import List, Optional
-from threading import Lock
+from threading import Lock, Semaphore
+import time
 
 app = Flask(__name__)
 
 # Device and instance setup
 num_gpus = torch.cuda.device_count()
-cpu_workers = int(os.environ.get("TTS_CPU_WORKERS", "4"))
+cpu_workers = int(os.environ.get("TTS_CPU_WORKERS", "8"))
 devices = [f"cuda:{i}" for i in range(num_gpus)] + ["cpu"] * max(1, cpu_workers)
 
 TTS_INSTANCES = [TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(dev) for dev in devices]
 INSTANCE_LOCKS = [Lock() for _ in TTS_INSTANCES]
+WORKER_BACKLOG = int(os.environ.get("TTS_WORKER_BACKLOG", "2"))
+QUEUE_SEMAPHORES = [Semaphore(WORKER_BACKLOG) for _ in TTS_INSTANCES]
 gc.collect()
 
 def acquire_instance():
-    """Acquire TTS instance, preferring GPUs first."""
-    # Try GPUs first (non-blocking)
-    for i in range(min(num_gpus, len(INSTANCE_LOCKS))):
-        if INSTANCE_LOCKS[i].acquire(blocking=False):
-            return TTS_INSTANCES[i], INSTANCE_LOCKS[i]
-    
-    # Try any available instance (non-blocking)
-    for i, lock in enumerate(INSTANCE_LOCKS):
-        if lock.acquire(blocking=False):
-            return TTS_INSTANCES[i], lock
-    
-    # Wait for first available (prefer GPU)
-    idx = 0 if num_gpus > 0 else 0
-    INSTANCE_LOCKS[idx].acquire()
-    return TTS_INSTANCES[idx], INSTANCE_LOCKS[idx]
+    """Acquire instance with per-worker backlog; prefer GPUs, then CPUs."""
+    total = len(TTS_INSTANCES)
+    gpu_range = range(min(num_gpus, total))
+    cpu_range = range(num_gpus, total)
+    while True:
+        for i in gpu_range:
+            if QUEUE_SEMAPHORES[i].acquire(blocking=False):
+                INSTANCE_LOCKS[i].acquire()
+                return TTS_INSTANCES[i], INSTANCE_LOCKS[i], i
+        for i in cpu_range:
+            if QUEUE_SEMAPHORES[i].acquire(blocking=False):
+                INSTANCE_LOCKS[i].acquire()
+                return TTS_INSTANCES[i], INSTANCE_LOCKS[i], i
+        time.sleep(0.005)
 
 @contextmanager
 def managed_buffer():
@@ -127,7 +129,7 @@ def synthesize():
         audio_file.save(tmp)
         speaker_kwargs['speaker_wav'] = tmp
 
-    tts_model, instance_lock = acquire_instance()
+    tts_model, instance_lock, worker_idx = acquire_instance()
     
     # Get default speaker if available
     default_speaker = (getattr(tts_model, 'speakers', [None]) or [None])[0] if (
@@ -145,6 +147,7 @@ def synthesize():
                 gc.collect()
         finally:
             instance_lock.release()
+            QUEUE_SEMAPHORES[worker_idx].release()
 
         return send_file(final_buf, mimetype="audio/wav", as_attachment=True, download_name="output.wav")
     except Exception as e:
