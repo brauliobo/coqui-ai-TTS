@@ -157,5 +157,5 @@ def synthesize():
         tmp and os.path.exists(tmp) and os.remove(tmp)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10230, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=10230, debug=False, use_reloader=False, threaded=True)
 
