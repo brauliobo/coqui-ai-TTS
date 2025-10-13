@@ -177,7 +177,7 @@ def synthesize():
     temperature = request.args.get('temperature', default=0.0, type=float)
     speaker_id = request.args.get('speaker', type=int)
     if speaker_id is None:
-        speaker_id = request.form.get('speaker', default=1, type=int)
+        speaker_id = request.form.get('speaker', default=31, type=int)
 
     final_buf, worker_idx = None, None
     try:
