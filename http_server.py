@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, jsonify
 from TTS.api import TTS
 from TTS.tts.utils.text.cleaners import *
 import torch
@@ -9,11 +9,15 @@ import re
 import wave
 import gc
 from contextlib import contextmanager
+import inspect
+from cachetools import LRUCache
+import traceback
 from typing import List, Optional
 from threading import Lock, Semaphore
 import time
 
 app = Flask(__name__)
+DEBUG_MODE = os.environ.get("DEBUG", "0") == "1"
 
 # Performance knobs
 torch.set_num_threads(int(os.environ.get("TTS_TORCH_THREADS", "1")))
@@ -27,15 +31,30 @@ num_gpus = torch.cuda.device_count()
 cpu_workers = int(os.environ.get("TTS_CPU_WORKERS", "8"))
 devices = [f"cuda:{i}" for i in range(num_gpus)] + ["cpu"] * max(1, cpu_workers)
 
-TTS_INSTANCES = [TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(dev) for dev in devices]
-INSTANCE_LOCKS = [Lock() for _ in TTS_INSTANCES]
-WORKER_BACKLOG = int(os.environ.get("TTS_WORKER_BACKLOG", "4"))
-QUEUE_SEMAPHORES = [Semaphore(WORKER_BACKLOG) for _ in TTS_INSTANCES]
+MODEL_CACHE = LRUCache(maxsize=max(1, len(devices)))
+MODEL_CACHE_LOCK = Lock()
+
+def get_model_for_device(device: str) -> TTS:
+    with MODEL_CACHE_LOCK:
+        m = MODEL_CACHE.get(device)
+        if m is not None:
+            return m
+    new_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+    with MODEL_CACHE_LOCK:
+        existing = MODEL_CACHE.get(device)
+        if existing is not None:
+            return existing
+        MODEL_CACHE[device] = new_model
+        return new_model
+
+INSTANCE_LOCKS = [Lock() for _ in devices]
+WORKER_BACKLOG = int(os.environ.get("TTS_WORKER_BACKLOG", "5"))
+QUEUE_SEMAPHORES = [Semaphore(WORKER_BACKLOG) for _ in devices]
 gc.collect()
 
 def acquire_instance():
     """Acquire queue slot (not lock) preferring GPUs; return model and worker index."""
-    total = len(TTS_INSTANCES)
+    total = len(devices)
     gpu_range = range(min(num_gpus, total))
     cpu_range = range(num_gpus, total)
     while True:
@@ -44,10 +63,10 @@ def acquire_instance():
         s = (int(time.time() * 1000) % len(g)) if g else 0
         for i in (g[s:] + g[:s]):
             if QUEUE_SEMAPHORES[i].acquire(blocking=False):
-                return TTS_INSTANCES[i], i
+                return get_model_for_device(devices[i]), i
         for i in cpu_range:
             if QUEUE_SEMAPHORES[i].acquire(blocking=False):
-                return TTS_INSTANCES[i], i
+                return get_model_for_device(devices[i]), i
         time.sleep(0.005)
 
 @contextmanager
@@ -90,20 +109,24 @@ def split_sentences(text: str, max_len: int = MAX_CHARS) -> List[str]:
     return chunks + [buf.strip()] if buf else chunks or [text.strip()]
 
 
-def synth_segment(text: str, language: str, speaker: Optional[str], worker_idx: int, tts_model: TTS, **kwargs) -> io.BytesIO:
-    """Synthesize one segment; acquire/release per-worker lock only around GPU call."""
+def synth_segment(text: str, language: str, worker_idx: int, tts_model: TTS, **kwargs) -> io.BytesIO:
+    """Synthesize one segment; write to a temp file path to ensure compatibility, then load into memory."""
     lock = INSTANCE_LOCKS[worker_idx]
-    with managed_buffer() as buf:
-        # Pre-clean outside the critical section
-        clean_text = clean_text_for_tts(text, language)
-        lock.acquire()
-        try:
-            tts_model.tts_to_file(text=clean_text, language=language,
-                                  file_path=buf, speaker=speaker, **kwargs)
-        finally:
-            lock.release()
+    clean_text = clean_text_for_tts(text, language)
+    tmp_out = f"{uuid.uuid4()}.wav"
+    lock.acquire()
+    try:
+        tts_model.tts_to_file(text=clean_text, language=language, file_path=tmp_out, **kwargs)
+    finally:
+        lock.release()
+    try:
+        with open(tmp_out, "rb") as f:
+            data = f.read()
+        buf = io.BytesIO(data)
         buf.seek(0)
-        return io.BytesIO(buf.getvalue())
+        return buf
+    finally:
+        os.path.exists(tmp_out) and os.remove(tmp_out)
 
 
 def concat_wavs(buffers: List[io.BytesIO]) -> io.BytesIO:
@@ -132,6 +155,13 @@ def concat_wavs(buffers: List[io.BytesIO]) -> io.BytesIO:
         raise
 
 
+@app.route('/speakers', methods=['GET'])
+def list_speakers():
+    model = get_model_for_device(devices[0]) if devices else None
+    speakers = list(getattr(model, 'speakers', []) or []) if model else []
+    return jsonify([{'id': i, 'name': s} for i, s in enumerate(speakers)])
+
+
 @app.route('/synthesize', methods=['POST'])
 def synthesize():
     if not (text := request.form.get('text')) or not (language := request.form.get('language')):
@@ -144,32 +174,53 @@ def synthesize():
         audio_file.save(tmp)
         speaker_kwargs['speaker_wav'] = tmp
 
-    tts_model, worker_idx = acquire_instance()
-    
-    # Get default speaker if available
-    default_speaker = (getattr(tts_model, 'speakers', [None]) or [None])[0] if (
-        not speaker_kwargs and getattr(tts_model, 'is_multi_speaker', False)
-    ) else None
+    temperature = request.args.get('temperature', default=0.0, type=float)
+    speaker_id = request.args.get('speaker', type=int)
+    if speaker_id is None:
+        speaker_id = request.form.get('speaker', default=1, type=int)
 
-    final_buf = None
+    final_buf, worker_idx = None, None
     try:
+        tts_model, worker_idx = acquire_instance()
+
+        speakers = list(getattr(tts_model, 'speakers', []) or [])
+        default_speaker = None
+        if not speaker_kwargs and getattr(tts_model, 'is_multi_speaker', False) and speakers:
+            idx = speaker_id if 0 <= speaker_id < len(speakers) else (1 if len(speakers) > 1 else 0)
+            default_speaker = speakers[idx]
+            sig_params = set(inspect.signature(tts_model.tts_to_file).parameters.keys())
+            if 'speaker' in sig_params:
+                speaker_kwargs['speaker'] = default_speaker
+            elif 'speaker_idx' in sig_params:
+                speaker_kwargs['speaker_idx'] = idx
+            elif 'speaker_id' in sig_params:
+                speaker_kwargs['speaker_id'] = idx
+
+        sig = inspect.signature(tts_model.tts_to_file)
+        tts_kwargs = dict(speaker_kwargs)
+        if 'temperature' in sig.parameters:
+            tts_kwargs['temperature'] = temperature
+
         try:
-            final_buf = (synth_segment(text, language, default_speaker, worker_idx, tts_model, **speaker_kwargs) 
-                        if len(text) <= MAX_CHARS else 
-                        concat_wavs([synth_segment(seg, language, default_speaker, worker_idx, tts_model, **speaker_kwargs) 
+            final_buf = (synth_segment(text, language, worker_idx, tts_model, **tts_kwargs)
+                        if len(text) <= MAX_CHARS else
+                        concat_wavs([synth_segment(seg, language, worker_idx, tts_model, **tts_kwargs)
                                    for seg in split_sentences(text)]))
             if len(text) > MAX_CHARS:
                 gc.collect()
         finally:
-            QUEUE_SEMAPHORES[worker_idx].release()
+            worker_idx is not None and QUEUE_SEMAPHORES[worker_idx].release()
 
         return send_file(final_buf, mimetype="audio/wav", as_attachment=True, download_name="output.wav")
-    except Exception as e:
+    except Exception:
         final_buf and final_buf.close()
-        return str(e), 500
+        if DEBUG_MODE:
+            app.logger.exception("/synthesize failed")
+            return traceback.format_exc(), 500
+        return "Internal Server Error", 500
     finally:
         tmp and os.path.exists(tmp) and os.remove(tmp)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10230, debug=False, use_reloader=False, threaded=True)
+    app.run(host='0.0.0.0', port=10230, debug=DEBUG_MODE, use_reloader=False, threaded=True)
 
