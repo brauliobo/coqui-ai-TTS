@@ -10,7 +10,7 @@ import wave
 import gc
 from contextlib import contextmanager
 import inspect
-from cachetools import LRUCache
+from cachetools import TTLCache
 import traceback
 from typing import List, Optional
 from threading import Lock, Semaphore
@@ -31,7 +31,8 @@ num_gpus = torch.cuda.device_count()
 cpu_workers = int(os.environ.get("TTS_CPU_WORKERS", "8"))
 devices = [f"cuda:{i}" for i in range(num_gpus)] + ["cpu"] * max(1, cpu_workers)
 
-MODEL_CACHE = LRUCache(maxsize=max(1, len(devices)))
+MODEL_CACHE_TTL = int(os.environ.get("TTS_MODEL_CACHE_TTL_SECONDS", "600"))
+MODEL_CACHE = TTLCache(maxsize=max(1, len(devices)), ttl=MODEL_CACHE_TTL)
 MODEL_CACHE_LOCK = Lock()
 
 def get_model_for_device(device: str) -> TTS:
