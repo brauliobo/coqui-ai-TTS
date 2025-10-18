@@ -49,7 +49,7 @@ def get_model_for_device(device: str) -> TTS:
         return new_model
 
 INSTANCE_LOCKS = [Lock() for _ in devices]
-WORKER_BACKLOG = int(os.environ.get("TTS_WORKER_BACKLOG", "5"))
+WORKER_BACKLOG = int(os.environ.get("TTS_WORKER_BACKLOG", "10"))
 QUEUE_SEMAPHORES = [Semaphore(WORKER_BACKLOG) for _ in devices]
 gc.collect()
 
