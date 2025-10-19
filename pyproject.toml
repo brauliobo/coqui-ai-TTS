@@ -25,10 +25,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "coqui-tts"
-version = "0.27.1"
+version = "0.27.2"
 description = "Deep learning for Text to Speech."
 readme = "README.md"
-requires-python = ">=3.10, <3.13"
+requires-python = ">=3.10, <3.14"
 license = {text = "MPL-2.0"}
 authors = [
     {name = "Eren Gölge", email = "egolge@coqui.ai"}
@@ -42,7 +42,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.13",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
@@ -57,12 +58,12 @@ classifiers = [
 dependencies = [
     # Core
     "numpy>=1.26.0",
-    "cython>=3.0.0",
     "scipy>=1.13.0",
     "torch>=2.1,<2.9",
     "torchaudio>=2.1.0,<2.9",
     "soundfile>=0.12.0",
     "librosa>=0.11.0",
+    "numba>=0.58.0",
     "inflect>=5.6.0",
     "tqdm>=4.64.1",
     "anyascii>=0.3.0",
@@ -78,11 +79,12 @@ dependencies = [
     "coqui-tts-trainer>=0.3.0,<0.4.0",
     "coqpit-config>=0.2.0,<0.3.0",
     "monotonic-alignment-search>=0.1.0",
+    "ko-speech-tools>=0.1.0",
     # Gruut + supported languages
     "gruut[de,es,fr]>=2.4.0",
     # Tortoise
     "einops>=0.6.0",
-    "transformers>=4.52.1",
+    "transformers>=4.52.1,<4.56",
     # Bark
     "encodec>=0.1.1",
     # XTTS
@@ -107,10 +109,7 @@ bn = [
 ]
 # Korean
 ko = [
-    "hangul_romanize>=0.1.0",
-    "jamo>=0.4.1",
-    "g2pkk>=0.1.1",
-    "pip>=22.2",
+    "ko-speech-tools[g2p]>=0.1.0",
 ]
 # Japanese
 ja = [
@@ -119,12 +118,13 @@ ja = [
 ]
 # Chinese
 zh = [
-    "jieba>=0.42.1",
+    "spacy_pkuseg>=1.0.1",
     "pypinyin>=0.40.0",
 ]
 # All language-specific dependencies
 languages = [
     "coqui-tts[bn,ja,ko,zh]",
+    "uroman>=1.3.1.1",
 ]
 # Installs all extras (except dev and docs)
 all = [
@@ -158,9 +158,6 @@ Discussions = "https://github.com/idiap/coqui-ai-TTS/discussions"
 [project.scripts]
 tts = "TTS.bin.synthesize:main"
 tts-server = "TTS.server.server:main"
-
-[tool.uv]
-constraint-dependencies = ["numba>0.58.0"]
 
 [tool.hatch.build]
 exclude = [

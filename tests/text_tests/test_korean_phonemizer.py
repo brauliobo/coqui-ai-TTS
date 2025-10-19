@@ -25,7 +25,3 @@ class TestText(unittest.TestCase):
         for line in _TEST_CASES_EN.strip().split("\n"):
             text, phone = line.split("/")
             self.assertEqual(korean_text_to_phonemes(text, character="english"), phone)
-
-
-if __name__ == "__main__":
-    unittest.main()
